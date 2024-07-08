@@ -5,7 +5,9 @@ This code licensed under BSD3-clause license
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
 #include <stdbool.h>
+#include <zlib.h>
 #include <zopfli/zopfli.h>
 
 typedef unsigned char u8;
@@ -275,7 +277,7 @@ u8* dec_ascii85(u8* str, size_t *len)
             }
         }
     }
-    // End block
+    // Last block
     if(flag > 1){
         uint8_t shift = 0;
         // Add hiden zeroes
@@ -299,10 +301,268 @@ u8* dec_ascii85(u8* str, size_t *len)
     return buf;
 }
 
+u8* dec_rle(u8* str, size_t *len)
+{
+    size_t sz  = *len * 2;
+    u8 *out  = malloc(sz);
+    size_t out_pos = 0;
+    for(size_t k = 0; k < *len;){
+        if(str[k] == 128){
+            break;
+        } else if (str[k] < 128){
+            if((out_pos + str[k] + 1) > sz){
+                sz *= 2;
+                out = realloc(out, sz);
+            }
+            // Copy folowing n bytes:
+            memcpy(out + out_pos, str + k + 1, str[k] + 1);
+            out_pos += str[k] + 1;
+            k+= str[k];
+        } else if(str[k] > 128){
+            if((out_pos + 257 - str[k]) > sz){
+                sz *= 2;
+                out = realloc(out, sz);
+            }
+            //Copy next byte n times
+            memset(out + out_pos, str[k+1], 257 - str[k]);
+            out_pos += 257 - str[k];
+            k+=2;
+        }
+    }
+    *len = out_pos;
+    return out;
+}
+
+u8* dec_deflate(u8* str, size_t *len)
+{
+    int ret;
+    z_stream strm;
+    size_t dlen = *len*2;
+    u8 *out = malloc(dlen);
+
+    // Init structure
+    strm.zalloc = Z_NULL;
+    strm.zfree = Z_NULL;
+    strm.opaque = Z_NULL;
+    strm.avail_in = 0;
+    strm.next_in = Z_NULL;
+    ret = inflateInit(&strm);
+    if (ret != Z_OK)
+        return NULL;
+
+    strm.avail_in = *len;
+    strm.next_in = str;
+    strm.avail_out = dlen;
+    strm.next_out = out;
+    // Decompression loop
+    do{
+        ret = inflate(&strm, Z_NO_FLUSH);
+        switch (ret) {
+            case Z_NEED_DICT:
+                ret = Z_DATA_ERROR;     /* and fall through */
+            case Z_DATA_ERROR:
+            case Z_MEM_ERROR:
+                inflateEnd(&strm);
+                return NULL;  
+            }
+        if(ret != Z_STREAM_END){
+            // Increase buffer and continue decompression.
+            unsigned char *tmp = malloc(dlen*2);
+            memcpy(tmp, out, dlen);
+            free(out);
+            out = tmp;
+            strm.avail_out = dlen;
+            strm.next_out = out + dlen;
+            dlen*=2;
+        }
+    } while (ret != Z_STREAM_END);
+    *len = dlen - strm.avail_out;
+    inflateEnd(&strm);
+    return out;
+}
+
+
+typedef enum FilterID{
+    asciihex = 0,
+    ascii85,
+    rle,
+    flate,
+    unsupported
+} FilterID;//*/
+
+typedef struct Filter{
+    FilterID id;
+    u8* pointer;
+    size_t len;
+} Filter;
+
+const char *asciihex_str = "/ASCIIHexDecode";
+const char *ascii85_str = "/ASCII85Decode";
+const char *rle_str = "/RunLengthDecode";
+const char *flate_str = "/FlateDecode";
+
+Filter filter_to_enum(u8* str, size_t size)
+{
+    size_t ah_l = strlen(asciihex_str);   
+    size_t a85_l = strlen(ascii85_str);
+    size_t fl_l = strlen(flate_str);
+    size_t rl_l = strlen(rle_str);
+    Filter ret;
+    if((size >= ah_l) && (strncmp((const char*)str, asciihex_str,ah_l) == 0)){
+        ret.id = asciihex;
+        ret.pointer = str;
+        ret.len = ah_l;
+    } else if((size >= a85_l) && (strncmp((const char*)str, ascii85_str,a85_l) == 0)){
+        ret.id = ascii85;
+        ret.pointer = str;
+        ret.len = a85_l;
+    } else if((size >= fl_l) && (strncmp((const char*)str, flate_str,fl_l) == 0)){
+        ret.id = flate;
+        ret.pointer = str;
+        ret.len = fl_l;
+    } else if((size >= rl_l) && (strncmp((const char*)str, rle_str,rl_l) == 0)){
+        ret.id = rle;
+        ret.pointer = str;
+        ret.len = rl_l;
+    } else{
+        ret.id = unsupported;
+        ret.pointer = str;
+        size_t k = 0;
+        for(k = 0; k < size; k++){
+            if(str[k] == ' '){
+                break;
+            }
+        }
+        ret.len = k;
+    }
+    return ret;
+}
+
+Filter* get_filters(const u8* header, size_t *count, u8 **filt_begin)
+{
+    u8* fp = memmem(header, *count, "/Filter", 7);
+    *filt_begin = fp;
+    if(fp == NULL){// No filters
+        *count = 0;
+        return NULL;
+    }
+    fp += 7;
+    //Find filter enum
+    while((*fp != '/') && (*fp != '[')){
+        fp++;
+    };
+    Filter* fl = malloc(sizeof(Filter));
+    size_t fl_count = 0;
+    if(*fp == '/'){
+        fl[0] = filter_to_enum(fp, *count - (fp - header));
+        fl_count++;
+    }else if(*fp == '['){
+        do{
+            fp++;
+            if(*fp == '/'){
+                fl[fl_count] = filter_to_enum(fp, *count - (fp - header));
+                fl_count++;
+                fl = realloc(fl, (fl_count + 1)*sizeof(Filter));
+            }
+        }while(*fp != ']');
+    }else{
+
+    }
+    *count = fl_count;
+    return fl;
+}
 
 void obj_compress(object *obj)
 {
-    
+    size_t filt_count = obj->h_len;
+    u8* filt_begin;
+    Filter* filters = get_filters(obj->header, &filt_count, &filt_begin);
+    size_t len = obj->b_len;
+    // Unpack stream
+    u8* un_comp = malloc(len);
+    memcpy(un_comp, obj->body, len);
+    bool is_uns = false;
+    size_t k;
+    for(k = 0; k < filt_count; k++){
+        u8* tmp;
+        is_uns = false;
+        switch (filters[k].id){
+            case asciihex:
+                tmp = dec_ascii_hex(un_comp, &len);
+                break;
+            case ascii85:
+                tmp = dec_ascii85(un_comp, &len);
+                break;
+            case rle:
+                tmp = dec_rle(un_comp, &len);
+                break;
+            case flate:
+                tmp = dec_deflate(un_comp, &len);
+                break;
+            case unsupported:
+                is_uns = true;
+                break;
+        }
+        if(!is_uns){
+            free(un_comp);
+            un_comp = tmp;
+        } else{
+            break;
+        }
+    }
+    printf("->%llu", len);
+    // Pack stream
+    u8* packed;
+    size_t pack_sz;
+    ZopfliOptions options;
+    ZopfliInitOptions(&options);
+    options.numiterations=2000;
+    ZopfliCompress(&options, ZOPFLI_FORMAT_ZLIB, un_comp, len, &packed, &pack_sz);
+    printf("->%llu", pack_sz);
+    if(pack_sz < obj->b_len){
+        printf(" (%lf\%)", (double)pack_sz / (double)obj->b_len * 100);
+        free(obj->body);
+        obj->body = packed;
+        obj->b_len = pack_sz;
+        // Update header
+        u8* deflate_str = "/Filter /FlateDecode ";
+        u8 buf_for_len[21];
+        snprintf(buf_for_len,21,"%llu", pack_sz);
+        //TODO: Fix /Length
+        size_t deflate_len = strlen(deflate_str);
+        u8* tmp;
+        switch (filt_count){
+            case 0:
+                tmp = malloc(obj->h_len + deflate_len + 1);
+                memcpy(tmp, obj->header, obj->h_len);
+                tmp[obj->h_len] = ' ';
+                memcpy(tmp + obj->h_len + 1, deflate_str, deflate_len);//*/
+                //printf("\n?????????????????n");
+                break;
+            case 1:
+                tmp = malloc(obj->h_len - filters[0].len - 7 + deflate_len );
+                memcpy(tmp, obj->header, filt_begin - obj->header);
+                memcpy(tmp + (filt_begin - obj->header), deflate_str, deflate_len);
+                //printf("\n!!!!!!!!!!!!\n");
+                //fwrite(filters[0].pointer, 1, 5, stdout);
+                //printf("\n!!!!!!!!!!!! %lu\n", filters[0].len);
+                memcpy(tmp + (filt_begin - obj->header) + deflate_len, filters[0].pointer + filters[0].len, obj->h_len - (filters[0].pointer - obj->header) - filters[0].len);
+
+                break;
+            default:
+                //TODO
+                break;
+        }
+        //free(tmp);
+        free(obj->header);
+        obj->header = tmp;
+    } else{
+        free(packed);
+        printf(" Skipped");
+    }
+
+    free(filters);
+    free(un_comp);
 }
 
 u8* through_pdf(u8* orig, long *in_size)
@@ -314,11 +574,13 @@ u8* through_pdf(u8* orig, long *in_size)
     while(walk_obj(&desc, &obj)){
     //walk_obj(&desc, &obj);
         if(obj.h_len != 0){
-            printf("%s\n", obj.header);
+            //printf("%s\n", obj.header);
         }
         if(obj.b_len != 0){
-            printf("Found stream: length %llu\n", obj.b_len);
+            printf("Found stream: length %llu", obj.b_len);
+            obj_compress(&obj);
         }
+        putc('\n', stdout);
         write_obj(&desc, &obj);
     };
     //delete_object(&obj);
@@ -330,16 +592,9 @@ u8* through_pdf(u8* orig, long *in_size)
 
 int main(int argc, char *argv[])
 {
-    u8* str = (u8*)"9jqo^BlbD-BleB1DJ+*+F(f,q/0JhKF<GL>Cj@.4Gp$d7F!,L7@<6@)/0JDEF<G%<+EV:2F!,O<DJ+*.@<*K0@<6L(Df-\\0Ec5e;DffZ(EZee.Bl.9pF\"AGXBPCsi+DGm>@3BB/F*&OCAfu2/AKYi(DIb:@FD,*)+C]U=@3BN#EcYf8ATD3s@q?d$AftVqCh[NqF<G:8+EV:.+Cf>-FD5W8ARlolDIal(DId<j@<?3r@:F%a+D58'ATD4$Bl@l3De:,-DJs`8ARoFb/0JMK@qB4^F!,R<AKZ&-DfTqBG%G>uD.RTpAKYo'+CT/5+Cei#DII?(E,9)oF*2M7/c~>";
-    size_t len = strlen((const char*)str);
-    printf("%lu\n", len);
-    str = dec_ascii85(str, &len);
-    fwrite(str, 1, len, stdout);
-    free(str);
-    printf("\n%lu\n", len);
     printf("pdfopt version 0.1, Copyright (c) 2024, Sergey Astafiev\n");
     printf("pdfopt is a lossless pdf compressor.\n");
-    /*
+    
     long pdf_size;
     u8* pdf_orig =  load_pdf("in.pdf", &pdf_size);
     u8* pdf_comp = through_pdf(pdf_orig, &pdf_size);
