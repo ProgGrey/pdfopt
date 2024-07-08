@@ -11,6 +11,13 @@ This code licensed under BSD3-clause license
 typedef unsigned char u8;
 
 
+u8 obj_begin_id[] = {0x20, 0x6F, 0x62, 0x6A, 0x0A, 0x3C, 0x3C};//" obj\n<<""
+u8 obj_end_id[] = {0x0A, 0x65, 0x6E, 0x64, 0x6F, 0x62, 0x6A, 0x0A};//"\nendobj\n"
+u8 stream_begin_id[] = {0x0A, 0x73, 0x74, 0x72, 0x65, 0x61, 0x6D, 0x0A};//\nstream\n
+u8 stream_end_id[] = {0x0A, 0x65, 0x6E, 0x64, 0x73, 0x74, 0x72, 0x65, 0x61, 0x6D, 0x0A};//\nendstream\n
+
+
+
 // Load pdf to memory
 u8* load_pdf(const char* filename, long *size)
 {
@@ -124,13 +131,11 @@ u8* obj_read_header(u8* str, size_t str_len, unsigned long long *size)
 
 u8* obj_read_stream(u8* str, size_t str_len, u8 **end, unsigned long long size)
 {
-    u8 stream_begin_id[] = {0x0A, 0x73, 0x74, 0x72, 0x65, 0x61, 0x6D, 0x0A};
-    u8 stream_end_id[] = {0x0A, 0x65, 0x6E, 0x64, 0x73, 0x74, 0x72, 0x65, 0x61, 0x6D, 0x0A};
-    u8* p = memmem(str, str_len, stream_begin_id, 8);
+    u8* p = memmem(str, str_len, stream_begin_id, sizeof(stream_begin_id));
     if(p != NULL){
         u8* buf = malloc(size);
         memcpy(buf, p+8, size);
-        *end = memmem(p+8+size, str_len - (p+8+size - str), stream_end_id, 11)+10;
+        *end = memmem(p+8+size, str_len - (p+8+size - str), stream_end_id, sizeof(stream_end_id))+10;
         return buf;
     } else{
         
@@ -143,11 +148,9 @@ u8* obj_read_stream(u8* str, size_t str_len, u8 **end, unsigned long long size)
 
 bool walk_obj(walker *desc, object *obj)
 {
-    const char obj_begin_id[] = {0x20, 0x6F, 0x62, 0x6A, 0x0A, 0x3C, 0x3C};//" obj\n<<""
-    const char obj_end_id[] = {0x0A, 0x65, 0x6E, 0x64, 0x6F, 0x62, 0x6A, 0x0A};//"\nendobj\n"
     delete_object(obj);
     //Find begining of the object
-    u8* po1 = (u8*) memmem((desc->in + desc->in_pos), desc->size - desc->in_pos, obj_begin_id, 7);
+    u8* po1 = (u8*) memmem((desc->in + desc->in_pos), desc->size - desc->in_pos, obj_begin_id, sizeof(obj_begin_id));
     if(po1 == NULL){
         return false;
     }
@@ -155,7 +158,7 @@ bool walk_obj(walker *desc, object *obj)
     walk_steps(desc, po1 - (desc->in + desc->in_pos));
     // Read object header:
     obj->header = obj_read_header(po1 + 4, desc->size - (po1 + 4 - desc->in) , &obj->h_len);
-    u8* po2 = po1 + 7 + obj->h_len + 2;//End of the object. Now it point to the end of the header
+    u8* po2 = po1 + sizeof(obj_begin_id) + obj->h_len + 2;//End of the object. Now it point to the end of the header
     // If header contains Length value then this object contains stream
     u8* plen = memmem(obj->header, obj->h_len, "/Length ", 8);
     if(plen != NULL){
@@ -166,10 +169,31 @@ bool walk_obj(walker *desc, object *obj)
         obj->b_len = 0;
     }
     //find end of the object.
-    po2 = memmem(po2, desc->size - (po2 - desc->in) , obj_end_id, 8);
-    walk_steps(desc, po2 - po1);
+    po2 = memmem(po2, desc->size - (po2 - desc->in) , obj_end_id, sizeof(obj_end_id));
+    //walk_steps(desc, po2 - po1);
+    desc->in_pos += po2 - po1 + sizeof(obj_end_id);
     //*/
     return true;
+}
+
+void walk_write(walker *desc, u8 *mem, size_t size)
+{
+    memcpy(desc->out+desc->out_pos, mem, size);
+    desc->out_pos += size;
+}
+
+
+void write_obj(walker *desc, object *obj)
+{
+    walk_write(desc, obj_begin_id, sizeof(obj_begin_id));
+    walk_write(desc, obj->header, obj->h_len);
+    walk_write(desc, ">>", 2);
+    if(obj->b_len != 0){
+        walk_write(desc, stream_begin_id, sizeof(stream_begin_id));
+        walk_write(desc, obj->body, obj->b_len);
+        walk_write(desc, stream_end_id, sizeof(stream_end_id)-1);
+    }
+    walk_write(desc, obj_end_id, sizeof(obj_end_id));
 }
 
 u8* through_pdf(u8* orig, long *in_size)
@@ -186,6 +210,7 @@ u8* through_pdf(u8* orig, long *in_size)
         if(obj.b_len != 0){
             printf("Found stream: length %llu\n", obj.b_len);
         }
+        write_obj(&desc, &obj);
     };
     //delete_object(&obj);
     walk_finish(&desc);
@@ -196,6 +221,7 @@ u8* through_pdf(u8* orig, long *in_size)
 
 int main()
 {
+    printf("%lu\n", sizeof(obj_begin_id));
     printf("pdfopt version 0.1\n");
     printf("pdfopt is a lossless pdf compressor.\n");
     long pdf_size;
