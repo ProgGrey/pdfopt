@@ -18,7 +18,7 @@ u8 stream_end_id[] = {0x0A, 0x65, 0x6E, 0x64, 0x73, 0x74, 0x72, 0x65, 0x61, 0x6D
 
 
 
-// Load pdf to memory
+// Load pdf into memory
 u8* load_pdf(const char* filename, long *size)
 {
     FILE *desc = fopen(filename, "rb");
@@ -135,7 +135,8 @@ u8* obj_read_stream(u8* str, size_t str_len, u8 **end, unsigned long long size)
     if(p != NULL){
         u8* buf = malloc(size);
         memcpy(buf, p+8, size);
-        *end = memmem(p+8+size, str_len - (p+8+size - str), stream_end_id, sizeof(stream_end_id))+10;
+        *end = memmem(p+8+size, str_len - (p+8+size - str), stream_end_id, sizeof(stream_end_id));
+        *end += 10;
         return buf;
     } else{
         
@@ -187,13 +188,121 @@ void write_obj(walker *desc, object *obj)
 {
     walk_write(desc, obj_begin_id, sizeof(obj_begin_id));
     walk_write(desc, obj->header, obj->h_len);
-    walk_write(desc, ">>", 2);
+    walk_write(desc, (u8*)">>", 2);
     if(obj->b_len != 0){
         walk_write(desc, stream_begin_id, sizeof(stream_begin_id));
         walk_write(desc, obj->body, obj->b_len);
         walk_write(desc, stream_end_id, sizeof(stream_end_id)-1);
     }
     walk_write(desc, obj_end_id, sizeof(obj_end_id));
+}
+
+u8 hextohb(u8 c)
+{
+    if(('0' <= c) && (c <= '9')){
+        return c - '0';
+    } else if(('A' <= c) && (c <= 'F')){
+        return c - 'A' + 10;
+    } else if(('a' <= c) && (c <= 'f')){
+        return c - 'a' + 10;
+    }else{
+        return 0;
+    }
+}
+
+u8* dec_ascii_hex(u8* str, size_t *len)
+{
+    u8* buf = malloc(*len/2);
+    *len = *len & (SIZE_MAX - 1);
+    size_t true_len = 0;
+    u8 val = 0;
+    bool flag = false;
+    for(size_t k = 0; k < *len; k++){
+        if(str[k] != ' '){
+            if(flag){
+                flag = false;
+                val <<= 4;
+                val |= hextohb(str[k]);
+                buf[true_len] = val;
+                true_len++;
+            } else{
+                flag = true;
+                val = hextohb(str[k]);
+            }
+            if(str[k] == '>'){
+                break;
+            }
+        }
+    }
+    *len= true_len;
+    return buf;
+}
+
+u8* dec_ascii85(u8* str, size_t *len)
+{
+    size_t t_len = *len * 4 / 5;
+    for(size_t k = 0; k < *len; k++){
+        if(str[k] == 'z'){
+            t_len+=4;
+        }
+    }
+    u8* buf = malloc(t_len);
+    uint64_t val = 0;
+    int flag = 0;
+    t_len = 0;
+    for(size_t k = 0; k < *len; k++){
+        if(str[k] != ' '){
+            if((0x21 <= str[k]) && (str[k] <= 0x75)){
+                val *= 85;
+                val += str[k] - 0x21;
+                flag++;
+            }else if(str[k] == 'z'){
+                val = 0;
+                flag = 5;
+            } else if(str[k] == '~'){
+                if((k == (*len - 1)) || (str[k+1] == '>')){
+                    break;
+                }
+            }
+            if(flag == 5){
+                for(int i = 3; i >= 0; i--){
+                    buf[t_len + i] = val & 0xFF;
+                    val >>= 8;
+                }
+                t_len+=4;
+                val = 0;
+                flag = 0;
+            }
+        }
+    }
+    // End block
+    if(flag > 1){
+        uint8_t shift = 0;
+        // Add hiden zeroes
+        for(int k = 0; k <= 4-flag; k++){
+            val *= 85;
+            shift += 8;
+        }
+        // Remove extra bytes
+        val >>= shift;
+        // Fix last byte
+        val++;
+        // Convert to base256 representation
+        for(int i = flag - 2; i >= 0; i--){
+            buf[t_len + i] = val & 0xFF;
+            val >>= 8;
+        }
+        // New length
+        t_len+=flag - 1;
+    }
+    *len = t_len;
+    return buf;
+}
+
+
+void obj_compress(object *obj)
+{
+    
 }
 
 u8* through_pdf(u8* orig, long *in_size)
@@ -219,16 +328,23 @@ u8* through_pdf(u8* orig, long *in_size)
 }
 
 
-int main()
+int main(int argc, char *argv[])
 {
-    printf("%lu\n", sizeof(obj_begin_id));
-    printf("pdfopt version 0.1\n");
+    u8* str = (u8*)"9jqo^BlbD-BleB1DJ+*+F(f,q/0JhKF<GL>Cj@.4Gp$d7F!,L7@<6@)/0JDEF<G%<+EV:2F!,O<DJ+*.@<*K0@<6L(Df-\\0Ec5e;DffZ(EZee.Bl.9pF\"AGXBPCsi+DGm>@3BB/F*&OCAfu2/AKYi(DIb:@FD,*)+C]U=@3BN#EcYf8ATD3s@q?d$AftVqCh[NqF<G:8+EV:.+Cf>-FD5W8ARlolDIal(DId<j@<?3r@:F%a+D58'ATD4$Bl@l3De:,-DJs`8ARoFb/0JMK@qB4^F!,R<AKZ&-DfTqBG%G>uD.RTpAKYo'+CT/5+Cei#DII?(E,9)oF*2M7/c~>";
+    size_t len = strlen((const char*)str);
+    printf("%lu\n", len);
+    str = dec_ascii85(str, &len);
+    fwrite(str, 1, len, stdout);
+    free(str);
+    printf("\n%lu\n", len);
+    printf("pdfopt version 0.1, Copyright (c) 2024, Sergey Astafiev\n");
     printf("pdfopt is a lossless pdf compressor.\n");
+    /*
     long pdf_size;
     u8* pdf_orig =  load_pdf("in.pdf", &pdf_size);
     u8* pdf_comp = through_pdf(pdf_orig, &pdf_size);
     save_pdf("out.pdf", pdf_comp, pdf_size);
     free(pdf_comp);
-    free(pdf_orig);
+    free(pdf_orig);//*/
     return 0;
 }

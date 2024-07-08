@@ -1,5 +1,5 @@
 CC=clang
-C_FLAGS=-O0 -march=native -std=gnu11 -g -fsanitize=address
+C_FLAGS=-march=native -std=gnu11 -Wall -Wextra -pedantic -O0 -g -fsanitize=address 
 LIBS=-lzopfli -lz
 
 test:pdfopt
